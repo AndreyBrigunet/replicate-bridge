@@ -1,0 +1,25 @@
+services:
+  replicate-bridge:
+    build:
+      context: .
+    container_name: replicate-bridge
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - ./data:/data
+    ports:
+      - "127.0.0.1:18080:8080"
+    networks:
+      - litellm
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/health', timeout=3)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+networks:
+  litellm:
+    external: true
+    name: ${LITELLM_NETWORK}
