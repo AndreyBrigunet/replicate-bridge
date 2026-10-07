@@ -439,7 +439,15 @@ async def parse_replicate_sse(stream_url: str):
             if line.startswith("event:"):
                 event_name = line[6:].strip()
             elif line.startswith("data:"):
-                data_lines.append(line[5:].lstrip())
+                value = line[5:]
+            
+                # SSE permite un singur spațiu separator după "data:".
+                # Eliminăm doar acel separator, nu spațiile care fac parte
+                # din output-ul modelului.
+                if value.startswith(" "):
+                    value = value[1:]
+            
+                data_lines.append(value)
 
 
 async def openai_stream(prediction: dict[str, Any], completion_id: str):
