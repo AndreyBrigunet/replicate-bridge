@@ -1,23 +1,19 @@
-# Replicate OpenAI Bridge
+# Replicate OpenAI Bridge v1.1.0
 
-OpenAI-compatible bridge for a Replicate community model.
+- Docker startup sends zero requests to Replicate.
+- Keepalive always starts OFF.
+- `POST /admin/keepalive/start` enables keepalive and schedules a warm-up ping.
+- Real `/v1/chat/completions` traffic works independently of keepalive and never enables it.
+- Real requests have priority over automatic keepalive.
+- Real 429 responses are retried after Replicate's cooldown.
+- Keepalive 429 responses are skipped rather than retried aggressively.
+- Predictions are created asynchronously and polled to completion; `Prefer: wait` is not used.
 
-## What it does
-
-- `POST /v1/chat/completions`
+Endpoints:
+- `GET /health`
 - `GET /v1/models`
-- Replicate native SSE -> OpenAI SSE
-- Smart keep-alive: real requests reset the timer
-- Start/stop/status/manual-ping admin endpoints
-- Persistent keep-alive enabled/disabled state
-
-## Admin endpoints
-
+- `POST /v1/chat/completions`
 - `GET /admin/keepalive/status`
 - `POST /admin/keepalive/start`
 - `POST /admin/keepalive/stop`
 - `POST /admin/keepalive/ping`
-
-## Scope
-
-Text chat is supported. OpenAI native tool/function calling is not emulated.
