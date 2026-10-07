@@ -393,12 +393,13 @@ async def run_keepalive_ping() -> dict[str, Any]:
                 "status": "error",
                 "error": str(exc),
             }
-
+        
         finally:
             async with state_lock:
                 state["ping_in_progress"] = False
+                state["ping_started_at"] = None
                 state["current_ping_prediction_id"] = None
-
+        
             ping_done_event.set()
 
 
@@ -488,7 +489,7 @@ async def lifespan(app: FastAPI):
             await client.aclose()
 
 
-app = FastAPI(title="Replicate OpenAI Bridge", version="1.1.0", lifespan=lifespan)
+app = FastAPI(title="Replicate OpenAI Bridge", version="1.1.1", lifespan=lifespan)
 
 
 @app.get("/health")
@@ -505,29 +506,99 @@ async def models() -> dict[str, Any]:
 async def chat_completions(request: Request):
     payload = await request.json()
     requested_model = payload.get("model", MODEL_NAME)
+
     if requested_model != MODEL_NAME:
-        raise HTTPException(status_code=404, detail=f"Unknown model '{requested_model}'")
+        raise HTTPException(
+            status_code=404,
+            detail=f"Unknown model '{requested_model}'",
+        )
+
     model_input = build_replicate_input(payload)
     completion_id = f"chatcmpl-{uuid.uuid4().hex}"
     stream = bool(payload.get("stream"))
+
     await begin_real_activity()
+
     if stream:
         try:
-            prediction = await create_prediction(model_input, request_kind="real", retry_429=True)
+            # Dacă warm-up-ul este deja pornit,
+            # așteptăm să termine înainte de requestul real.
+            await wait_for_inflight_ping()
+
+            prediction = await create_prediction(
+                model_input,
+                request_kind="real",
+                retry_429=True,
+            )
+
             if prediction is None:
-                raise HTTPException(status_code=503, detail="Replicate prediction was not created")
+                raise HTTPException(
+                    status_code=503,
+                    detail="Replicate prediction was not created",
+                )
+
         except Exception:
             await end_real_activity()
             raise
-        return StreamingResponse(openai_stream(prediction, completion_id), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+        return StreamingResponse(
+            openai_stream(prediction, completion_id),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "X-Accel-Buffering": "no",
+            },
+        )
+
     try:
-        prediction = await create_prediction(model_input, request_kind="real", retry_429=True)
+        # Dacă warm-up-ul este deja pornit,
+        # nu mai creăm încă un prediction.
+        await wait_for_inflight_ping()
+
+        prediction = await create_prediction(
+            model_input,
+            request_kind="real",
+            retry_429=True,
+        )
+
         if prediction is None:
-            raise HTTPException(status_code=503, detail="Replicate prediction was not created")
+            raise HTTPException(
+                status_code=503,
+                detail="Replicate prediction was not created",
+            )
+
         prediction = await wait_for_prediction(prediction)
-        content = normalize_output(prediction.get("output"))
+
+        content = normalize_output(
+            prediction.get("output")
+        )
+
         metrics = prediction.get("metrics") or {}
-        return JSONResponse({"id": completion_id, "object": "chat.completion", "created": int(time.time()), "model": MODEL_NAME, "choices": [{"index": 0, "message": {"role": "assistant", "content": content}, "finish_reason": "stop"}], "replicate": {"prediction_id": prediction.get("id"), "predict_time": metrics.get("predict_time"), "total_time": metrics.get("total_time")}})
+
+        return JSONResponse(
+            {
+                "id": completion_id,
+                "object": "chat.completion",
+                "created": int(time.time()),
+                "model": MODEL_NAME,
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {
+                            "role": "assistant",
+                            "content": content,
+                        },
+                        "finish_reason": "stop",
+                    }
+                ],
+                "replicate": {
+                    "prediction_id": prediction.get("id"),
+                    "predict_time": metrics.get("predict_time"),
+                    "total_time": metrics.get("total_time"),
+                },
+            }
+        )
+
     finally:
         await end_real_activity()
 
@@ -573,6 +644,7 @@ async def keepalive_stop() -> dict[str, Any]:
     return {"enabled": False, "message": "Keepalive disabled"}
 
 
+
 @app.post("/admin/keepalive/ping", dependencies=[Depends(require_admin_auth)])
 async def keepalive_ping() -> dict[str, Any]:
-    return await run_keepalive_ping(force=True)
+    return await run_keepalive_ping()
