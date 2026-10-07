@@ -606,23 +606,61 @@ async def chat_completions(request: Request):
 @app.get("/admin/keepalive/status", dependencies=[Depends(require_admin_auth)])
 async def keepalive_status() -> dict[str, Any]:
     async with state_lock:
-        idle_for = max(0.0, time.monotonic() - float(state["last_activity_monotonic"]))
+        idle_for = max(
+            0.0,
+            time.monotonic()
+            - float(state["last_activity_monotonic"]),
+        )
+
         enabled = bool(state["enabled"])
-        next_ping = max(0.0, KEEPALIVE_INTERVAL_SECONDS - idle_for) if enabled else None
+        ping_in_progress = bool(
+            state["ping_in_progress"]
+        )
+
+        next_ping = (
+            max(
+                0.0,
+                KEEPALIVE_INTERVAL_SECONDS - idle_for,
+            )
+            if enabled and not ping_in_progress
+            else None
+        )
+
         return {
             "enabled": enabled,
             "interval_seconds": KEEPALIVE_INTERVAL_SECONDS,
             "seconds_since_activity": round(idle_for, 2),
-            "next_ping_in_seconds": round(next_ping, 2) if next_ping is not None else None,
+
+            "next_ping_in_seconds": (
+                round(next_ping, 2)
+                if next_ping is not None
+                else None
+            ),
+
             "last_real_request": state["last_real_request"],
             "active_real_requests": state["active_real_requests"],
+
+            "ping_in_progress": ping_in_progress,
+            "ping_started_at": state["ping_started_at"],
+            "current_ping_prediction_id": state[
+                "current_ping_prediction_id"
+            ],
+
             "last_rate_limit": state["last_rate_limit"],
-            "last_rate_limit_retry_after": state["last_rate_limit_retry_after"],
+            "last_rate_limit_retry_after": state[
+                "last_rate_limit_retry_after"
+            ],
+
             "last_ping": state["last_ping"],
             "last_ping_status": state["last_ping_status"],
-            "last_ping_predict_time": state["last_ping_predict_time"],
-            "last_ping_total_time": state["last_ping_total_time"],
+            "last_ping_predict_time": state[
+                "last_ping_predict_time"
+            ],
+            "last_ping_total_time": state[
+                "last_ping_total_time"
+            ],
             "last_ping_error": state["last_ping_error"],
+
             "model": MODEL_NAME,
         }
 
@@ -631,10 +669,41 @@ async def keepalive_status() -> dict[str, Any]:
 async def keepalive_start() -> dict[str, Any]:
     async with state_lock:
         already_enabled = bool(state["enabled"])
+
+        active_real_requests = int(state["active_real_requests"])
+
+        ping_in_progress = bool(state["ping_in_progress"])
+
         state["enabled"] = True
-    if not already_enabled:
-        asyncio.create_task(run_keepalive_ping(force=False))
-    return {"enabled": True, "warmup_started": not already_enabled, "message": "Keepalive enabled; warm-up ping started" if not already_enabled else "Keepalive already enabled"}
+        state["last_activity_monotonic"] = time.monotonic()
+
+    warmup_started = False
+
+    if (
+        not already_enabled
+        and active_real_requests == 0
+        and not ping_in_progress
+    ):
+        asyncio.create_task(run_keepalive_ping())
+        warmup_started = True
+
+    if warmup_started:
+        message = "Keepalive enabled; warm-up ping started"
+
+    elif ping_in_progress:
+        message = "Keepalive enabled; warm-up already running"
+
+    elif active_real_requests > 0:
+        message = "Keepalive enabled; real request already active"
+
+    else:
+        message = "Keepalive already enabled"
+
+    return {
+        "enabled": True,
+        "warmup_started": warmup_started,
+        "message": message,
+    }
 
 
 @app.post("/admin/keepalive/stop", dependencies=[Depends(require_admin_auth)])
