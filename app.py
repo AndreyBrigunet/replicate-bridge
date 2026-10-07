@@ -38,6 +38,8 @@ keepalive_task: asyncio.Task | None = None
 state_lock = asyncio.Lock()
 ping_lock = asyncio.Lock()
 prediction_create_lock = asyncio.Lock()
+ping_done_event = asyncio.Event()
+ping_done_event.set()
 state: dict[str, Any] = {
     "enabled": False,
     "last_activity_monotonic": time.monotonic(),
@@ -51,6 +53,9 @@ state: dict[str, Any] = {
     "last_ping_predict_time": None,
     "last_ping_total_time": None,
     "last_ping_error": None,
+    "ping_in_progress": False,
+    "ping_started_at": None,
+    "current_ping_prediction_id": None,
 }
 
 
@@ -178,6 +183,31 @@ async def end_real_activity() -> None:
         state["last_real_request"] = utc_now()
 
 
+async def wait_for_inflight_ping() -> None:
+    async with state_lock:
+        ping_in_progress = bool(state["ping_in_progress"])
+        prediction_id = state["current_ping_prediction_id"]
+
+    if not ping_in_progress:
+        return
+
+    logger.info(
+        "real request waiting for keepalive warm-up prediction=%s",
+        prediction_id,
+    )
+
+    try:
+        await asyncio.wait_for(
+            ping_done_event.wait(),
+            timeout=REPLICATE_MAX_WAIT_SECONDS + 30,
+        )
+    except asyncio.TimeoutError:
+        logger.warning(
+            "timed out waiting for keepalive warm-up; "
+            "real request will continue"
+        )
+
+
 async def create_prediction(model_input: dict[str, Any], *, request_kind: str, retry_429: bool) -> dict[str, Any] | None:
     assert client is not None
     headers = {"Authorization": f"Bearer {REPLICATE_API_TOKEN}", "Content-Type": "application/json"}
@@ -244,44 +274,132 @@ async def wait_for_prediction(prediction: dict[str, Any]) -> dict[str, Any]:
     raise HTTPException(status_code=504, detail=f"Replicate prediction exceeded {REPLICATE_MAX_WAIT_SECONDS}s")
 
 
-async def run_keepalive_ping(*, force: bool = False) -> dict[str, Any]:
-    if ping_lock.locked() and not force:
-        return {"skipped": True, "reason": "ping already running"}
+async def run_keepalive_ping() -> dict[str, Any]:
+    if ping_lock.locked():
+        return {
+            "skipped": True,
+            "reason": "ping already running",
+        }
+
     async with state_lock:
-        if not force and state["active_real_requests"] > 0:
-            return {"skipped": True, "reason": "real request active"}
+        if state["active_real_requests"] > 0:
+            return {
+                "skipped": True,
+                "reason": "real request active",
+            }
+
     async with ping_lock:
         async with state_lock:
-            if not force and state["active_real_requests"] > 0:
-                return {"skipped": True, "reason": "real request active"}
-        ping_input = {"prompt": "OK", "system_prompt": "", "max_tokens": 1, "temperature": 0, "top_p": 1, "top_k": 1}
+            if state["active_real_requests"] > 0:
+                return {
+                    "skipped": True,
+                    "reason": "real request active",
+                }
+
+            ping_done_event.clear()
+
+            state["ping_in_progress"] = True
+            state["ping_started_at"] = utc_now()
+            state["current_ping_prediction_id"] = None
+            state["last_ping_status"] = "starting"
+            state["last_ping_error"] = None
+
+        ping_input = {
+            "prompt": "OK",
+            "system_prompt": "",
+            "max_tokens": 1,
+            "temperature": 0,
+            "top_p": 1,
+            "top_k": 1,
+        }
+
         started = time.monotonic()
+
         try:
-            prediction = await create_prediction(ping_input, request_kind="keepalive", retry_429=False)
+            prediction = await create_prediction(
+                ping_input,
+                request_kind="keepalive",
+                retry_429=False,
+            )
+
             if prediction is None:
                 async with state_lock:
                     state["last_ping"] = utc_now()
                     state["last_ping_status"] = "skipped"
-                    state["last_ping_error"] = None
-                return {"skipped": True, "reason": "real request or Replicate cooldown"}
-            prediction = await wait_for_prediction(prediction)
-            metrics = prediction.get("metrics") or {}
+                    state["last_ping_error"] = (
+                        "Replicate cooldown/rate limit"
+                    )
+                    state["last_activity_monotonic"] = (
+                        time.monotonic()
+                    )
+
+                return {
+                    "skipped": True,
+                    "reason": "Replicate cooldown/rate limit",
+                }
+
             async with state_lock:
-                state["last_activity_monotonic"] = time.monotonic()
+                state["current_ping_prediction_id"] = (
+                    prediction.get("id")
+                )
+                state["last_ping_status"] = (
+                    prediction.get("status") or "starting"
+                )
+
+            prediction = await wait_for_prediction(prediction)
+
+            metrics = prediction.get("metrics") or {}
+
+            async with state_lock:
+                state["last_activity_monotonic"] = (
+                    time.monotonic()
+                )
                 state["last_ping"] = utc_now()
-                state["last_ping_status"] = prediction.get("status")
-                state["last_ping_predict_time"] = metrics.get("predict_time")
-                state["last_ping_total_time"] = metrics.get("total_time", time.monotonic() - started)
+                state["last_ping_status"] = (
+                    prediction.get("status")
+                )
+                state["last_ping_predict_time"] = (
+                    metrics.get("predict_time")
+                )
+                state["last_ping_total_time"] = metrics.get(
+                    "total_time",
+                    time.monotonic() - started,
+                )
                 state["last_ping_error"] = None
-            logger.info("keepalive succeeded predict_time=%s total_time=%s", state["last_ping_predict_time"], state["last_ping_total_time"])
-            return {"status": prediction.get("status"), "metrics": metrics}
+
+            logger.info(
+                "keepalive succeeded predict_time=%s total_time=%s",
+                state["last_ping_predict_time"],
+                state["last_ping_total_time"],
+            )
+
+            return {
+                "status": prediction.get("status"),
+                "metrics": metrics,
+            }
+
         except Exception as exc:
             async with state_lock:
+                state["last_activity_monotonic"] = (
+                    time.monotonic()
+                )
                 state["last_ping"] = utc_now()
                 state["last_ping_status"] = "error"
                 state["last_ping_error"] = str(exc)
+
             logger.exception("keepalive failed")
-            return {"status": "error", "error": str(exc)}
+
+            return {
+                "status": "error",
+                "error": str(exc),
+            }
+
+        finally:
+            async with state_lock:
+                state["ping_in_progress"] = False
+                state["current_ping_prediction_id"] = None
+
+            ping_done_event.set()
 
 
 async def keepalive_loop() -> None:
