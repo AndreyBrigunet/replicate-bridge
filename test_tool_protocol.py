@@ -84,14 +84,16 @@ class ToolProtocolTests(unittest.TestCase):
             async def prediction(_):
                 return {"output": ["<tool_call><function=web_search>",
                                    "<parameter=query>today</parameter></function></tool_call>"]}
+            async def cleanup():
+                return None
             with patch.object(app, "wait_for_prediction", prediction):
-                with patch.object(app, "end_real_activity", prediction):
+                with patch.object(app, "end_real_activity", cleanup):
                     async for item in app.openai_stream({}, "chatcmpl-test", self.payload):
                         result.append(item)
             return result
 
         chunks = asyncio.run(consume())
-        events = [json.loads(row.removeprefix("data: ")) for row in chunks if row != "data: [DONE]\\n\\n"]
+        events = [json.loads(row.removeprefix("data: ")) for row in chunks if not row.startswith("data: [DONE]")]
         self.assertEqual(events[-1]["choices"][0]["finish_reason"], "tool_calls")
         self.assertEqual(events[1]["choices"][0]["delta"]["tool_calls"][0]["function"]["name"], "web_search")
         self.assertFalse(any("content" in event["choices"][0]["delta"] for event in events))
