@@ -1,4 +1,4 @@
-import ast
+import asyncio
 import json
 import os
 import unittest
@@ -76,6 +76,25 @@ class ToolProtocolTests(unittest.TestCase):
         self.assertEqual(reason, "tool_calls")
         self.assertEqual(len(message["tool_calls"]), 2)
         self.assertNotEqual(message["tool_calls"][0]["id"], message["tool_calls"][1]["id"])
+
+
+    def test_streamed_tool_chunks(self):
+        async def consume():
+            result = []
+            async def prediction(_):
+                return {"output": ["<tool_call><function=web_search>",
+                                   "<parameter=query>today</parameter></function></tool_call>"]}
+            with patch.object(app, "wait_for_prediction", prediction):
+                with patch.object(app, "end_real_activity", prediction):
+                    async for item in app.openai_stream({}, "chatcmpl-test", self.payload):
+                        result.append(item)
+            return result
+
+        chunks = asyncio.run(consume())
+        events = [json.loads(row.removeprefix("data: ")) for row in chunks if row != "data: [DONE]\\n\\n"]
+        self.assertEqual(events[-1]["choices"][0]["finish_reason"], "tool_calls")
+        self.assertEqual(events[1]["choices"][0]["delta"]["tool_calls"][0]["function"]["name"], "web_search")
+        self.assertFalse(any("content" in event["choices"][0]["delta"] for event in events))
 
 
 if __name__ == "__main__":
