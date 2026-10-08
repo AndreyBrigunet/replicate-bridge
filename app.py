@@ -99,22 +99,65 @@ def content_to_text(content: Any) -> str:
 
 
 def build_prompt(messages: list[dict[str, Any]]) -> tuple[str, str]:
+    """Serialize OpenAI conversation messages for the Replicate model.
+
+    REPLICATE_PROMPT_FORMAT=legacy retains the old User:/Assistant: serializer.
+    REPLICATE_PROMPT_FORMAT=qwen-chatml serializes the complete conversation
+    using Qwen's ChatML role delimiters; its system text moves into prompt.
+
+    IMPORTANT: The community Replicate model only accepts prompt/system_prompt.
+    Its internal tokenizer/template logic is not documented. ChatML could be
+    double-wrapped on the remote side. Compare real model output before
+    making qwen-chatml the permanent production setting.
+    """
+    mode = os.getenv("REPLICATE_PROMPT_FORMAT", "legacy").strip().lower()
+    if mode == "legacy":
+        system_parts: list[str] = []
+        conversation: list[str] = []
+        for message in messages:
+            role = str(message.get("role", "user")).lower()
+            content = content_to_text(message.get("content"))
+            if role in {"system", "developer"}:
+                system_parts.append(content)
+            elif role == "assistant":
+                conversation.append(f"Assistant: {content}")
+            elif role == "tool":
+                name = message.get("name") or message.get("tool_call_id") or "tool"
+                conversation.append(f"Tool ({name}): {content}")
+            else:
+                conversation.append(f"User: {content}")
+        conversation.append("Assistant:")
+        return "\n\n".join(system_parts).strip(), "\n\n".join(conversation).strip()
+
+    if mode != "qwen-chatml":
+        raise ValueError(
+            "Invalid REPLICATE_PROMPT_FORMAT; use 'legacy' or 'qwen-chatml'"
+        )
+
+    # Qwen2.5 chat template. We send system_prompt='' to avoid duplicating
+    # the same instructions in TWO Replicate input fields.
     system_parts: list[str] = []
-    conversation: list[str] = []
+    turns: list[tuple[str, str]] = []
     for message in messages:
         role = str(message.get("role", "user")).lower()
         content = content_to_text(message.get("content"))
-        if role == "system":
+        if role in {"system", "developer"}:
             system_parts.append(content)
-        elif role == "assistant":
-            conversation.append(f"Assistant: {content}")
         elif role == "tool":
             name = message.get("name") or message.get("tool_call_id") or "tool"
-            conversation.append(f"Tool ({name}): {content}")
+            turns.append(("user", f"<tool_response>\n{name}: {content}\n</tool_response>"))
+        elif role in {"user", "assistant"}:
+            turns.append((role, content))
         else:
-            conversation.append(f"User: {content}")
-    conversation.append("Assistant:")
-    return "\n\n".join(system_parts).strip(), "\n\n".join(conversation).strip()
+            turns.append(("user", content))
+
+    chunks: list[str] = []
+    if system_parts:
+        chunks.append("<|im_start|>system\n" + "\n\n".join(system_parts) + "<|im_end|>")
+    for role, content in turns:
+        chunks.append(f"<|im_start|>{role}\n{content}<|im_end|>")
+    chunks.append("<|im_start|>assistant\n")
+    return "", "\n".join(chunks)
 
 
 def build_replicate_input(payload: dict[str, Any]) -> dict[str, Any]:
