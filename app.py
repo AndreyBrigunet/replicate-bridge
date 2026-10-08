@@ -98,6 +98,114 @@ def content_to_text(content: Any) -> str:
     return str(content)
 
 
+
+TOOL_BLOCK_RE = re.compile(r"<tool_call>\s*(.*?)\s*</tool_call>", re.DOTALL)
+FUNCTION_RE = re.compile(r"<function=([\w.-]+)>(.*?)</function>", re.DOTALL)
+PARAM_RE = re.compile(r"<parameter=([\w.-]+)>(.*?)</parameter>", re.DOTALL)
+
+
+def serialize_tool_calls(message: dict[str, Any]) -> str:
+    blocks = []
+    for call in message.get("tool_calls") or []:
+        function = call.get("function") or {}
+        name = function.get("name", "")
+        raw_arguments = function.get("arguments", "{}")
+        try:
+            arguments = json.loads(raw_arguments) if isinstance(raw_arguments, str) else raw_arguments
+        except (ValueError, TypeError):
+            arguments = {}
+        if not isinstance(arguments, dict) or not name:
+            continue
+        params = []
+        for key, value in arguments.items():
+            rendered = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False)
+            params.append(f"<parameter={key}>{rendered}</parameter>")
+        blocks.append(f"<tool_call><function={name}>{''.join(params)}</function></tool_call>")
+    return "\n".join(blocks)
+
+
+def tool_instructions(payload: dict[str, Any]) -> str:
+    tools = [
+        t["function"] for t in (payload.get("tools") or [])
+        if t.get("type") == "function" and isinstance(t.get("function"), dict)
+    ]
+    if not tools or payload.get("tool_choice") == "none":
+        return ""
+    choice = payload.get("tool_choice")
+    required = choice == "required" or isinstance(choice, dict)
+    allowed = ""
+    if isinstance(choice, dict):
+        allowed = f" Only call {choice.get('function', {}).get('name', '')}."
+    return (
+        "Available tools (function definitions with JSON Schema):\n"
+        + json.dumps(tools, ensure_ascii=False)
+        + "\nTo call a tool output exactly <tool_call><function=NAME>"
+          "<parameter=KEY>VALUE</parameter></function></tool_call>, one parameter per argument."
+          " Do not invent tool names." + allowed
+        + (" You must call a tool." if required else " Otherwise answer normally.")
+    )
+
+
+def parse_tool_calls(content: str, payload: dict[str, Any]) -> tuple[str, list[dict[str, Any]]]:
+    """Extract only well-formed, permitted tool calls; keep invalid calls as text."""
+    allowed = {
+        t.get("function", {}).get("name")
+        for t in payload.get("tools") or []
+        if t.get("type") == "function"
+    }
+    if not allowed or payload.get("tool_choice") == "none":
+        return content, []
+    calls = []
+    spans = []
+    for block in TOOL_BLOCK_RE.finditer(content):
+        function = FUNCTION_RE.fullmatch(block.group(1).strip())
+        if not function:
+            continue
+        name, body = function.groups()
+        if name not in allowed:
+            continue
+        arguments = {}
+        pos = 0
+        valid = True
+        for parameter in PARAM_RE.finditer(body):
+            if body[pos:parameter.start()].strip():
+                valid = False
+                break
+            key, value = parameter.groups()
+            try:
+                arguments[key] = json.loads(value)
+            except (ValueError, TypeError):
+                arguments[key] = value
+            pos = parameter.end()
+        if not valid or body[pos:].strip():
+            continue
+        calls.append({
+            "id": "call_" + uuid.uuid4().hex[:24],
+            "type": "function",
+            "function": {
+                "name": name,
+                "arguments": json.dumps(arguments, ensure_ascii=False),
+            },
+        })
+        spans.append(block.span())
+    if not calls:
+        return content, []
+    parts = []
+    pos = 0
+    for start, end in spans:
+        parts.append(content[pos:start])
+        pos = end
+    parts.append(content[pos:])
+    return "".join(parts).strip(), calls
+
+
+def completion_message(content: str, payload: dict[str, Any]) -> tuple[dict[str, Any], str]:
+    clean, calls = parse_tool_calls(content, payload)
+    if calls:
+        return {"role": "assistant", "content": clean or None, "tool_calls": calls}, "tool_calls"
+    return {"role": "assistant", "content": content}, "stop"
+
+
 def build_prompt(messages: list[dict[str, Any]]) -> tuple[str, str]:
     """Serialize OpenAI conversation messages for the Replicate model.
 
@@ -117,6 +225,8 @@ def build_prompt(messages: list[dict[str, Any]]) -> tuple[str, str]:
         for message in messages:
             role = str(message.get("role", "user")).lower()
             content = content_to_text(message.get("content"))
+            if role == "assistant":
+                content = "\n".join(filter(None, [content, serialize_tool_calls(message)]))
             if role in {"system", "developer"}:
                 system_parts.append(content)
             elif role == "assistant":
@@ -141,6 +251,8 @@ def build_prompt(messages: list[dict[str, Any]]) -> tuple[str, str]:
     for message in messages:
         role = str(message.get("role", "user")).lower()
         content = content_to_text(message.get("content"))
+        if role == "assistant":
+            content = "\n".join(filter(None, [content, serialize_tool_calls(message)]))
         if role in {"system", "developer"}:
             system_parts.append(content)
         elif role == "tool":
@@ -165,6 +277,12 @@ def build_replicate_input(payload: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(messages, list) or not messages:
         raise HTTPException(status_code=400, detail="'messages' must be a non-empty array")
     system_prompt, prompt = build_prompt(messages)
+    instructions = tool_instructions(payload)
+    if instructions:
+        if os.getenv("REPLICATE_PROMPT_FORMAT", "legacy").strip().lower() == "qwen-chatml":
+            prompt = "<|im_start|>system\n" + instructions + "<|im_end|>\n" + prompt
+        else:
+            system_prompt = "\n\n".join(filter(None, [system_prompt, instructions]))
     model_input: dict[str, Any] = {
         "prompt": prompt,
         "system_prompt": system_prompt,
@@ -493,29 +611,26 @@ async def parse_replicate_sse(stream_url: str):
                 data_lines.append(value)
 
 
-async def openai_stream(prediction: dict[str, Any], completion_id: str):
+async def openai_stream(prediction: dict[str, Any], completion_id: str, payload: dict[str, Any]):
+    """Emit protocol-correct chunks based on the complete Replicate prediction.
+
+    Buffering also prevents partial <tool_call> markup leaking as content.
+    """
     try:
+        prediction = await wait_for_prediction(prediction)
+        content = normalize_output(prediction.get("output"))
+        message, finish_reason = completion_message(content, payload)
         yield openai_chunk(completion_id, {"role": "assistant"})
-        stream_url = prediction.get("urls", {}).get("stream")
-        if stream_url:
-            try:
-                async for event_name, data in parse_replicate_sse(stream_url):
-                    if event_name == "output":
-                        yield openai_chunk(completion_id, {"content": data})
-                    elif event_name == "error":
-                        logger.error("Replicate stream error: %s", data)
-                    elif event_name == "done":
-                        break
-                yield openai_chunk(completion_id, {}, "stop")
-                yield "data: [DONE]\n\n"
-                return
-            except Exception:
-                logger.exception("Native streaming failed; falling back to polling")
-        final_prediction = await wait_for_prediction(prediction)
-        content = normalize_output(final_prediction.get("output"))
-        if content:
-            yield openai_chunk(completion_id, {"content": content})
-        yield openai_chunk(completion_id, {}, "stop")
+        if message.get("content"):
+            yield openai_chunk(completion_id, {"content": message["content"]})
+        for index, call in enumerate(message.get("tool_calls", [])):
+            yield openai_chunk(completion_id, {"tool_calls": [{
+                "index": index,
+                "id": call["id"],
+                "type": "function",
+                "function": call["function"],
+            }]})
+        yield openai_chunk(completion_id, {}, finish_reason)
         yield "data: [DONE]\n\n"
     finally:
         await end_real_activity()
@@ -593,7 +708,7 @@ async def chat_completions(request: Request):
             raise
 
         return StreamingResponse(
-            openai_stream(prediction, completion_id),
+            openai_stream(prediction, completion_id, payload),
             media_type="text/event-stream",
             headers={
                 "Cache-Control": "no-cache",
@@ -625,6 +740,7 @@ async def chat_completions(request: Request):
         )
 
         metrics = prediction.get("metrics") or {}
+        message, finish_reason = completion_message(content, payload)
 
         return JSONResponse(
             {
@@ -635,11 +751,8 @@ async def chat_completions(request: Request):
                 "choices": [
                     {
                         "index": 0,
-                        "message": {
-                            "role": "assistant",
-                            "content": content,
-                        },
-                        "finish_reason": "stop",
+                        "message": message,
+                        "finish_reason": finish_reason,
                     }
                 ],
                 "replicate": {
