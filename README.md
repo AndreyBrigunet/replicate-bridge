@@ -17,3 +17,15 @@ Endpoints:
 - `POST /admin/keepalive/start`
 - `POST /admin/keepalive/stop`
 - `POST /admin/keepalive/ping`
+
+
+Keepalive
+```bash
+chmod +x keepalive
+```
+
+```bash
+./keepalive start
+./keepalive stop
+./keepalive status
+```
