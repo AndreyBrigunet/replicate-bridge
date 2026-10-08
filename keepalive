@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ACTION="${1:-}"
+case "$ACTION" in
+  start|stop|status) ;;
+  *) echo "Utilizare: ./keepalive {start|stop|status}" >&2; exit 2 ;;
+esac
+
+cd "$(dirname "$(realpath "$0")")"
+
+docker compose exec -T replicate-bridge python - "$ACTION" <<'PY'
+import json
+import os
+import sys
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
+
+action = sys.argv[1]
+method = "GET" if action == "status" else "POST"
+token = os.environ.get("ADMIN_TOKEN", "")
+headers = {"Authorization": f"Bearer {token}"} if token else {}
+url = f"http://127.0.0.1:8080/admin/keepalive/{action}"
+
+try:
+    with urlopen(Request(url, headers=headers, method=method), timeout=20) as response:
+        result = json.load(response)
+except HTTPError as exc:
+    print(f"HTTP {exc.code}: {exc.read().decode('utf-8', errors='replace')}", file=sys.stderr)
+    sys.exit(1)
+except URLError as exc:
+    print(f"Nu ma pot conecta la bridge: {exc}", file=sys.stderr)
+    sys.exit(1)
+
+print(json.dumps(result, indent=2, ensure_ascii=False))
+PY
