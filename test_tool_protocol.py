@@ -32,6 +32,42 @@ class ToolProtocolTests(unittest.TestCase):
         self.assertEqual(message["tool_calls"][0]["function"]["name"], "web_search")
         self.assertEqual(json.loads(message["tool_calls"][0]["function"]["arguments"]), {"query": "weather today"})
 
+    def test_observed_missing_function_open_bracket(self):
+        output = "<tool_call>function=skills_list</function></tool_call>"
+        payload = {"tools": [{"type": "function", "function": {"name": "skills_list"}}]}
+        message, reason = app.completion_message(output, payload)
+        self.assertEqual(reason, "tool_calls")
+        self.assertEqual(message["tool_calls"][0]["function"]["name"], "skills_list")
+        self.assertEqual(json.loads(message["tool_calls"][0]["function"]["arguments"]), {})
+
+    def test_observed_missing_function_close_bracket(self):
+        output = "<tool_call><function=skills_list</function></tool_call>"
+        payload = {"tools": [{"type": "function", "function": {"name": "skills_list"}}]}
+        message, reason = app.completion_message(output, payload)
+        self.assertEqual(reason, "tool_calls")
+        self.assertEqual(message["tool_calls"][0]["function"]["name"], "skills_list")
+
+    def test_observed_skill_name_leading_newline(self):
+        output = (
+            "<tool_call>\\n<function=skill_view>\\n"
+            "<parameter=name>\\nweb-security-assessment</parameter>"
+            "</function></tool_call>"
+        )
+        message, reason = app.completion_message(output, {
+            "tools": [{"type": "function", "function": {"name": "skill_view"}}]
+        })
+        self.assertEqual(reason, "tool_calls")
+        self.assertEqual(
+            json.loads(message["tool_calls"][0]["function"]["arguments"]),
+            {"name": "web-security-assessment"},
+        )
+
+    def test_never_execute_unknown_malformed_tool(self):
+        output = "<tool_call>function=made_up</function></tool_call>"
+        message, reason = app.completion_message(output, self.payload)
+        self.assertEqual(reason, "stop")
+        self.assertEqual(message["content"], output)
+
     def test_unknown_tool_stays_as_text(self):
         output = "<tool_call><function=not_allowed></function></tool_call>"
         message, reason = app.completion_message(output, self.payload)
