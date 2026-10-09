@@ -3,6 +3,8 @@ import json
 import os
 import unittest
 from unittest.mock import patch
+from fastapi.testclient import TestClient
+from fastapi import HTTPException
 
 os.environ.setdefault("REPLICATE_API_TOKEN", "test")
 os.environ.setdefault("REPLICATE_VERSION", "test")
@@ -80,23 +82,66 @@ class ToolProtocolTests(unittest.TestCase):
 
     def test_streamed_tool_chunks(self):
         async def consume():
-            result = []
-            async def prediction(_):
-                return {"output": ["<tool_call><function=web_search>",
-                                   "<parameter=query>today</parameter></function></tool_call>"]}
-            async def cleanup():
-                return None
-            with patch.object(app, "wait_for_prediction", prediction):
-                with patch.object(app, "end_real_activity", cleanup):
-                    async for item in app.openai_stream({}, "chatcmpl-test", self.payload):
-                        result.append(item)
-            return result
+            chunks = []
+            async for chunk in app.openai_stream({
+                "output": [
+                    "<tool_call><function=web_search>",
+                    "<parameter=query>today</parameter></function></tool_call>",
+                ],
+            }, "chatcmpl-test", self.payload):
+                chunks.append(chunk)
+            return chunks
 
         chunks = asyncio.run(consume())
-        events = [json.loads(row.removeprefix("data: ")) for row in chunks if not row.startswith("data: [DONE]")]
+        events = [
+            json.loads(row.removeprefix("data: "))
+            for row in chunks if not row.startswith("data: [DONE]")
+        ]
         self.assertEqual(events[-1]["choices"][0]["finish_reason"], "tool_calls")
         self.assertEqual(events[1]["choices"][0]["delta"]["tool_calls"][0]["function"]["name"], "web_search")
         self.assertFalse(any("content" in event["choices"][0]["delta"] for event in events))
+
+    def test_failed_prediction_returns_complete_http_502(self):
+        async def create_prediction(*args, **kwargs):
+            return {"id": "pred-failed", "status": "starting"}
+
+        async def wait_for_prediction(_prediction):
+            raise HTTPException(status_code=502, detail="Prediction failed: upstream 500")
+
+        payload = {
+            "model": app.MODEL_NAME,
+            "stream": True,
+            "messages": [{"role": "user", "content": "Hello"}],
+        }
+        with patch.object(app, "create_prediction", create_prediction):
+            with patch.object(app, "wait_for_prediction", wait_for_prediction):
+                with TestClient(app.app) as client:
+                    response = client.post("/v1/chat/completions", json=payload)
+        self.assertEqual(response.status_code, 502)
+        self.assertEqual(response.json()["detail"], "Prediction failed: upstream 500")
+        self.assertTrue(response.headers["content-type"].startswith("application/json"))
+
+    def test_successful_prediction_returns_complete_sse(self):
+        async def create_prediction(*args, **kwargs):
+            return {"id": "pred-success", "status": "starting"}
+
+        async def wait_for_prediction(_prediction):
+            return {"id": "pred-success", "status": "succeeded", "output": ["Hello!"]}
+
+        payload = {
+            "model": app.MODEL_NAME,
+            "stream": True,
+            "messages": [{"role": "user", "content": "Hello"}],
+        }
+        with patch.object(app, "create_prediction", create_prediction):
+            with patch.object(app, "wait_for_prediction", wait_for_prediction):
+                with TestClient(app.app) as client:
+                    response = client.post("/v1/chat/completions", json=payload)
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("text/event-stream", response.headers["content-type"])
+        self.assertIn('"content": "Hello!"', response.text)
+        self.assertIn('"finish_reason": "stop"', response.text)
+        self.assertTrue(response.text.endswith("data: [DONE]\\n\\n"))
 
 
 if __name__ == "__main__":
