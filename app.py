@@ -629,7 +629,7 @@ async def openai_stream(prediction: dict[str, Any], completion_id: str, payload:
             "function": call["function"],
         }]})
     yield openai_chunk(completion_id, {}, finish_reason)
-    yield "data: [DONE]\\n\\n".replace("\\n", "\n")
+    yield "data: [DONE]\\n\\n"
 
 
 @asynccontextmanager
