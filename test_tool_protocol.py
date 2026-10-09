@@ -72,11 +72,11 @@ class ToolProtocolTests(unittest.TestCase):
         with patch.dict(os.environ, {"REPLICATE_PROMPT_FORMAT": "qwen-chatml"}):
             model_input = app.build_replicate_input(payload)
         prompt = model_input["prompt"]
-        self.assertEqual(prompt.count("<|im_start|>system\\n"), 1)
-        self.assertTrue(prompt.startswith("<|im_start|>system\\n"))
+        self.assertEqual(prompt.count("<|im_start|>system\n"), 1)
+        self.assertTrue(prompt.startswith("<|im_start|>system\n"))
         self.assertIn("Hermes agent instructions", prompt)
         self.assertIn("web_search", prompt)
-        self.assertIn("<|im_start|>user\\nSearch the web", prompt)
+        self.assertIn("<|im_start|>user\nSearch the web", prompt)
         self.assertEqual(model_input["system_prompt"], "")
 
     def test_tools_without_system_message(self):
@@ -86,7 +86,7 @@ class ToolProtocolTests(unittest.TestCase):
         }
         with patch.dict(os.environ, {"REPLICATE_PROMPT_FORMAT": "qwen-chatml"}):
             prompt = app.build_replicate_input(payload)["prompt"]
-        self.assertEqual(prompt.count("<|im_start|>system\\n"), 1)
+        self.assertEqual(prompt.count("<|im_start|>system\n"), 1)
 
     def test_title_prompt_without_tools_unmodified(self):
         payload = {
@@ -97,7 +97,7 @@ class ToolProtocolTests(unittest.TestCase):
         }
         with patch.dict(os.environ, {"REPLICATE_PROMPT_FORMAT": "qwen-chatml"}):
             prompt = app.build_replicate_input(payload)["prompt"]
-        self.assertEqual(prompt.count("<|im_start|>system\\n"), 1)
+        self.assertEqual(prompt.count("<|im_start|>system\n"), 1)
         self.assertIn("Generate a title", prompt)
 
     def test_assistant_tool_history_is_preserved(self):
