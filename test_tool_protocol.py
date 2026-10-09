@@ -61,6 +61,45 @@ class ToolProtocolTests(unittest.TestCase):
         self.assertIn("web_search", model_input["prompt"])
         self.assertIn("parameters", model_input["prompt"])
 
+    def test_tools_merge_with_existing_system_message(self):
+        payload = {
+            **self.payload,
+            "messages": [
+                {"role": "system", "content": "Hermes agent instructions"},
+                {"role": "user", "content": "Search the web"},
+            ],
+        }
+        with patch.dict(os.environ, {"REPLICATE_PROMPT_FORMAT": "qwen-chatml"}):
+            model_input = app.build_replicate_input(payload)
+        prompt = model_input["prompt"]
+        self.assertEqual(prompt.count("<|im_start|>system\n"), 1)
+        self.assertTrue(prompt.startswith("<|im_start|>system\n"))
+        self.assertIn("Hermes agent instructions", prompt)
+        self.assertIn("web_search", prompt)
+        self.assertIn("<|im_start|>user\nSearch the web", prompt)
+        self.assertEqual(model_input["system_prompt"], "")
+
+    def test_tools_without_system_message(self):
+        payload = {
+            **self.payload,
+            "messages": [{"role": "user", "content": "Search"}],
+        }
+        with patch.dict(os.environ, {"REPLICATE_PROMPT_FORMAT": "qwen-chatml"}):
+            prompt = app.build_replicate_input(payload)["prompt"]
+        self.assertEqual(prompt.count("<|im_start|>system\n"), 1)
+
+    def test_title_prompt_without_tools_unmodified(self):
+        payload = {
+            "messages": [
+                {"role": "system", "content": "Generate a title"},
+                {"role": "user", "content": "Python"},
+            ],
+        }
+        with patch.dict(os.environ, {"REPLICATE_PROMPT_FORMAT": "qwen-chatml"}):
+            prompt = app.build_replicate_input(payload)["prompt"]
+        self.assertEqual(prompt.count("<|im_start|>system\n"), 1)
+        self.assertIn("Generate a title", prompt)
+
     def test_assistant_tool_history_is_preserved(self):
         message = {"role": "assistant", "content": None, "tool_calls": [{
             "function": {"name": "web_search", "arguments": '{"query":"test"}'},

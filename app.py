@@ -280,7 +280,13 @@ def build_replicate_input(payload: dict[str, Any]) -> dict[str, Any]:
     instructions = tool_instructions(payload)
     if instructions:
         if os.getenv("REPLICATE_PROMPT_FORMAT", "legacy").strip().lower() == "qwen-chatml":
-            prompt = "<|im_start|>system\n" + instructions + "<|im_end|>\n" + prompt
+            system_header = "<|im_start|>system\n"
+            if prompt.startswith(system_header):
+                # Qwen's Jinja template accepts only the first message as system.
+                # Keep Hermes instructions and tool schemas in one system block.
+                prompt = system_header + instructions + "\n\n" + prompt[len(system_header):]
+            else:
+                prompt = system_header + instructions + "<|im_end|>\n" + prompt
         else:
             system_prompt = "\n\n".join(filter(None, [system_prompt, instructions]))
     model_input: dict[str, Any] = {
