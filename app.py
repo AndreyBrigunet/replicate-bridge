@@ -612,28 +612,24 @@ async def parse_replicate_sse(stream_url: str):
 
 
 async def openai_stream(prediction: dict[str, Any], completion_id: str, payload: dict[str, Any]):
-    """Emit protocol-correct chunks based on the complete Replicate prediction.
+    """Serialize an already-completed prediction into OpenAI SSE chunks.
 
-    Buffering also prevents partial <tool_call> markup leaking as content.
+    Prediction errors must be handled before the HTTP stream is started.
     """
-    try:
-        prediction = await wait_for_prediction(prediction)
-        content = normalize_output(prediction.get("output"))
-        message, finish_reason = completion_message(content, payload)
-        yield openai_chunk(completion_id, {"role": "assistant"})
-        if message.get("content"):
-            yield openai_chunk(completion_id, {"content": message["content"]})
-        for index, call in enumerate(message.get("tool_calls", [])):
-            yield openai_chunk(completion_id, {"tool_calls": [{
-                "index": index,
-                "id": call["id"],
-                "type": "function",
-                "function": call["function"],
-            }]})
-        yield openai_chunk(completion_id, {}, finish_reason)
-        yield "data: [DONE]\n\n"
-    finally:
-        await end_real_activity()
+    content = normalize_output(prediction.get("output"))
+    message, finish_reason = completion_message(content, payload)
+    yield openai_chunk(completion_id, {"role": "assistant"})
+    if message.get("content"):
+        yield openai_chunk(completion_id, {"content": message["content"]})
+    for index, call in enumerate(message.get("tool_calls", [])):
+        yield openai_chunk(completion_id, {"tool_calls": [{
+            "index": index,
+            "id": call["id"],
+            "type": "function",
+            "function": call["function"],
+        }]})
+    yield openai_chunk(completion_id, {}, finish_reason)
+    yield "data: [DONE]\\n\\n"
 
 
 @asynccontextmanager
@@ -703,9 +699,11 @@ async def chat_completions(request: Request):
                     detail="Replicate prediction was not created",
                 )
 
-        except Exception:
+            # Resolve upstream failures before sending HTTP 200 headers.
+            prediction = await wait_for_prediction(prediction)
+
+        finally:
             await end_real_activity()
-            raise
 
         return StreamingResponse(
             openai_stream(prediction, completion_id, payload),
