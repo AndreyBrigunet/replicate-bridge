@@ -100,7 +100,9 @@ def content_to_text(content: Any) -> str:
 
 
 TOOL_BLOCK_RE = re.compile(r"<tool_call>\s*(.*?)\s*</tool_call>", re.DOTALL)
-FUNCTION_RE = re.compile(r"<function=([\w.-]+)>(.*?)</function>", re.DOTALL)
+# Qwen sometimes omits '<' before function=, or '>' for no-argument calls.
+# The tool name must still be present in the request's allowlist.
+FUNCTION_RE = re.compile(r"<?function=([\w.-]+)>?(.*?)</function>", re.DOTALL)
 PARAM_RE = re.compile(r"<parameter=([\w.-]+)>(.*?)</parameter>", re.DOTALL)
 
 
@@ -173,9 +175,14 @@ def parse_tool_calls(content: str, payload: dict[str, Any]) -> tuple[str, list[d
                 break
             key, value = parameter.groups()
             try:
-                arguments[key] = json.loads(value)
+                parsed_value = json.loads(value)
             except (ValueError, TypeError):
-                arguments[key] = value
+                parsed_value = value
+            # skill_view names are identifiers, never multiline text.
+            # Qwen sometimes starts the value on a new line.
+            if name == "skill_view" and key == "name" and isinstance(parsed_value, str):
+                parsed_value = parsed_value.strip()
+            arguments[key] = parsed_value
             pos = parameter.end()
         if not valid or body[pos:].strip():
             continue
