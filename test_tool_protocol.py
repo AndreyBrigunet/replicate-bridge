@@ -90,15 +90,17 @@ class ToolProtocolTests(unittest.TestCase):
 
     def test_never_execute_unknown_malformed_tool(self):
         output = "<tool_call>function=made_up</function></tool_call>"
-        message, reason = app.completion_message(output, self.payload)
-        self.assertEqual(reason, "stop")
-        self.assertEqual(message["content"], output)
+        with self.assertRaises(HTTPException) as error:
+            app.completion_message(output, self.payload)
+        self.assertEqual(error.exception.status_code, 502)
+        self.assertEqual(error.exception.detail["code"], "malformed_tool_call")
 
-    def test_unknown_tool_stays_as_text(self):
+    def test_unknown_tool_is_rejected(self):
         output = "<tool_call><function=not_allowed></function></tool_call>"
-        message, reason = app.completion_message(output, self.payload)
-        self.assertEqual(reason, "stop")
-        self.assertEqual(message["content"], output)
+        with self.assertRaises(HTTPException) as error:
+            app.completion_message(output, self.payload)
+        self.assertEqual(error.exception.status_code, 502)
+        self.assertEqual(error.exception.detail["code"], "malformed_tool_call")
 
     def test_malformed_tool_stays_as_text_when_tools_disabled(self):
         output = "<tool_call><function=web_search>not valid XML</function></tool_call>"
