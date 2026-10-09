@@ -62,21 +62,49 @@ class ToolProtocolTests(unittest.TestCase):
             {"name": "web-security-assessment"},
         )
 
+    def test_bare_function_and_missing_parameter_close(self):
+        output = (
+            "<tool_call>web_search><parameter=query>information"
+            "</parameter><parameter=limit>8parameter></function></tool_call>"
+        )
+        message, reason = app.completion_message(output, self.payload)
+        self.assertEqual(reason, "tool_calls")
+        self.assertEqual(message["tool_calls"][0]["function"]["name"], "web_search")
+        self.assertEqual(
+            json.loads(message["tool_calls"][0]["function"]["arguments"]),
+            {"query": "information", "limit": 8},
+        )
+
+    def test_malformed_tool_is_explicit_error(self):
+        output = "<tool_call><function=web_search>invalid body</function></tool_call>"
+        with self.assertRaises(HTTPException) as error:
+            app.completion_message(output, self.payload)
+        self.assertEqual(error.exception.status_code, 502)
+        self.assertEqual(error.exception.detail["code"], "malformed_tool_call")
+
+    def test_empty_model_output_is_explicit_error(self):
+        with self.assertRaises(HTTPException) as error:
+            app.completion_message("  ", self.payload)
+        self.assertEqual(error.exception.status_code, 502)
+        self.assertEqual(error.exception.detail["code"], "empty_model_output")
+
     def test_never_execute_unknown_malformed_tool(self):
         output = "<tool_call>function=made_up</function></tool_call>"
-        message, reason = app.completion_message(output, self.payload)
-        self.assertEqual(reason, "stop")
-        self.assertEqual(message["content"], output)
+        with self.assertRaises(HTTPException) as error:
+            app.completion_message(output, self.payload)
+        self.assertEqual(error.exception.status_code, 502)
+        self.assertEqual(error.exception.detail["code"], "malformed_tool_call")
 
-    def test_unknown_tool_stays_as_text(self):
+    def test_unknown_tool_is_rejected(self):
         output = "<tool_call><function=not_allowed></function></tool_call>"
-        message, reason = app.completion_message(output, self.payload)
-        self.assertEqual(reason, "stop")
-        self.assertEqual(message["content"], output)
+        with self.assertRaises(HTTPException) as error:
+            app.completion_message(output, self.payload)
+        self.assertEqual(error.exception.status_code, 502)
+        self.assertEqual(error.exception.detail["code"], "malformed_tool_call")
 
-    def test_malformed_tool_stays_as_text(self):
+    def test_malformed_tool_stays_as_text_when_tools_disabled(self):
         output = "<tool_call><function=web_search>not valid XML</function></tool_call>"
-        message, reason = app.completion_message(output, self.payload)
+        message, reason = app.completion_message(output, {})
         self.assertEqual(reason, "stop")
         self.assertEqual(message["content"], output)
 
@@ -216,7 +244,7 @@ class ToolProtocolTests(unittest.TestCase):
         self.assertIn("text/event-stream", response.headers["content-type"])
         self.assertIn('"content": "Hello!"', response.text)
         self.assertIn('"finish_reason": "stop"', response.text)
-        self.assertTrue(response.text.endswith("data: [DONE]\\n\\n"))
+        self.assertTrue(response.text.endswith("data: [DONE]\n\n"))
 
 
 if __name__ == "__main__":

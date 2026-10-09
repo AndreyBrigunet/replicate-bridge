@@ -103,7 +103,13 @@ TOOL_BLOCK_RE = re.compile(r"<tool_call>\s*(.*?)\s*</tool_call>", re.DOTALL)
 # Qwen sometimes omits '<' before function=, or '>' for no-argument calls.
 # The tool name must still be present in the request's allowlist.
 FUNCTION_RE = re.compile(r"<?function=([\w.-]+)>?(.*?)</function>", re.DOTALL)
-PARAM_RE = re.compile(r"<parameter=([\w.-]+)>(.*?)</parameter>", re.DOTALL)
+# Observed Qwen output can omit the entire 'function=' prefix (e.g. web_search>).
+BARE_FUNCTION_RE = re.compile(r"([\w.-]+)>(.*?)</function>", re.DOTALL)
+# Accept an observed missing '</' only at a parameter boundary or end of function.
+PARAM_RE = re.compile(
+    r"<parameter=([\w.-]+)>(.*?)(?:</parameter>|(?<![</])parameter>(?=\s*(?:<parameter=|$)))",
+    re.DOTALL,
+)
 
 
 def serialize_tool_calls(message: dict[str, Any]) -> str:
@@ -160,7 +166,10 @@ def parse_tool_calls(content: str, payload: dict[str, Any]) -> tuple[str, list[d
     calls = []
     spans = []
     for block in TOOL_BLOCK_RE.finditer(content):
-        function = FUNCTION_RE.fullmatch(block.group(1).strip())
+        body_text = block.group(1).strip()
+        function = FUNCTION_RE.fullmatch(body_text)
+        if not function:
+            function = BARE_FUNCTION_RE.fullmatch(body_text)
         if not function:
             continue
         name, body = function.groups()
@@ -207,7 +216,23 @@ def parse_tool_calls(content: str, payload: dict[str, Any]) -> tuple[str, list[d
 
 
 def completion_message(content: str, payload: dict[str, Any]) -> tuple[dict[str, Any], str]:
+    """Return OpenAI-compliant output or an explicit upstream protocol error."""
+    if not content.strip():
+        raise HTTPException(status_code=502, detail={
+            "code": "empty_model_output",
+            "message": "Replicate succeeded but generated no assistant content",
+        })
+
     clean, calls = parse_tool_calls(content, payload)
+    tools_enabled = bool(payload.get("tools")) and payload.get("tool_choice") != "none"
+    unparsed_tool_call = clean.lstrip().startswith("<tool_call>") if calls else content.lstrip().startswith("<tool_call>")
+
+    if tools_enabled and unparsed_tool_call:
+        raise HTTPException(status_code=502, detail={
+            "code": "malformed_tool_call",
+            "message": "Model returned a tool call that could not be parsed safely",
+        })
+
     if calls:
         return {"role": "assistant", "content": clean or None, "tool_calls": calls}, "tool_calls"
     return {"role": "assistant", "content": content}, "stop"
@@ -642,7 +667,7 @@ async def openai_stream(prediction: dict[str, Any], completion_id: str, payload:
             "function": call["function"],
         }]})
     yield openai_chunk(completion_id, {}, finish_reason)
-    yield "data: [DONE]\\n\\n"
+    yield "data: [DONE]\n\n"
 
 
 @asynccontextmanager
@@ -712,8 +737,9 @@ async def chat_completions(request: Request):
                     detail="Replicate prediction was not created",
                 )
 
-            # Resolve upstream failures before sending HTTP 200 headers.
+            # Resolve upstream failures AND invalid model output before committing HTTP 200.
             prediction = await wait_for_prediction(prediction)
+            completion_message(normalize_output(prediction.get("output")), payload)
 
         finally:
             await end_real_activity()
