@@ -49,8 +49,8 @@ class ToolProtocolTests(unittest.TestCase):
 
     def test_observed_skill_name_leading_newline(self):
         output = (
-            "<tool_call>\\n<function=skill_view>\\n"
-            "<parameter=name>\\nweb-security-assessment</parameter>"
+            "<tool_call>\n<function=skill_view>\n"
+            "<parameter=name>\nweb-security-assessment</parameter>"
             "</function></tool_call>"
         )
         message, reason = app.completion_message(output, {
